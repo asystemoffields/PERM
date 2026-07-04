@@ -140,11 +140,16 @@ def collect_hessians(model, batches, gguf_ne0, arch, n_layers,
             if not torch.is_floating_point(x):
                 return  # Embedding lookup role: ids in, no meaningful input Hessian
             x = x.detach().reshape(-1, x.shape[-1]).float()
-            xtx = (x.T @ x).clone()
+            # Hessian accumulation is float32; the X^T X is formed on x's device (GPU when the
+            # teacher is device_map'd there) then moved to the CPU accumulator -- so a big bf16
+            # teacher can live on the GPU while the [d,d] accumulators stay in host RAM (spares
+            # VRAM). token counts unchanged.
+            xtx = (x.T @ x)
             if gname not in acc:
-                acc[gname] = torch.zeros(x.shape[1], x.shape[1], dtype=torch.float32)
+                acc[gname] = torch.zeros(x.shape[1], x.shape[1], dtype=torch.float32,
+                                         device="cpu")
                 cnt[gname] = 0
-            acc[gname] += xtx
+            acc[gname] += xtx.to(acc[gname].device, torch.float32)
             cnt[gname] += x.shape[0]
         return fn
 
@@ -175,10 +180,19 @@ def collect_hessians(model, batches, gguf_ne0, arch, n_layers,
 
 
 def save_hessians(hessians, outdir):
+    """Persist each Hessian as float16 off-diagonal + a float32 diagonal ("diag32").
+
+    An input Hessian H = X^T X is symmetric PSD; its DIAGONAL is the per-channel second
+    moment that dominates both the GPTQ damping (mean of diag) and the token_embd column
+    weights, so it is kept EXACT in float32 while the (large, off-diagonal) bulk is stored in
+    float16 -- roughly halving the handoff. load_hessian writes the f32 diagonal back over the
+    fp16 one. Old float32-only npz files still load unchanged (no diag32 key)."""
     os.makedirs(outdir, exist_ok=True)
     for gname, h in hessians.items():
         fn = os.path.join(outdir, gname.replace(".", "_") + ".npz")
-        np.savez_compressed(fn, H=h["H"], n=h["n"], name=gname)
+        H = np.asarray(h["H"], dtype=np.float32)
+        diag32 = np.ascontiguousarray(np.diag(H)).astype(np.float32)
+        np.savez_compressed(fn, H=H.astype(np.float16), diag32=diag32, n=h["n"], name=gname)
 
 
 def _fallback_key(gguf_name):
@@ -207,7 +221,11 @@ def load_hessian(hessdir, gguf_name):
     for path in cand:
         if os.path.exists(path):
             z = np.load(path)
-            return z["H"].astype(np.float64), int(z["n"])
+            H = np.asarray(z["H"]).astype(np.float64)
+            if "diag32" in z.files:
+                # fp16-stored H: restore the exact float32 diagonal over the fp16 one
+                np.fill_diagonal(H, np.asarray(z["diag32"]).astype(np.float64))
+            return H, int(z["n"])
     raise FileNotFoundError(f"no Hessian for {gguf_name} (tried {cand})")
 
 

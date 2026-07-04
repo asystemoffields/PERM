@@ -6,7 +6,8 @@ permutation, exactly -- permute each <name>.in_sum2 along ne[0] with the same pe
 weight's ne[0]. counts unchanged."""
 
 
-def permute_imatrix(spacemap, src, dst, perms, dims, log=print):
-    n = spacemap.permute_imatrix(src, dst, perms, dims)
+def permute_imatrix(spacemap, src, dst, perms, dims, log=print, **kwargs):
+    """**kwargs (e.g. acknowledge_unreviewed) forwarded to the spacemap's permute_imatrix."""
+    n = spacemap.permute_imatrix(src, dst, perms, dims, **kwargs)
     log(f"patched {n} in_sum2 tensors -> {dst}")
     return n

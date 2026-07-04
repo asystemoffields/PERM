@@ -23,12 +23,16 @@ def cache_teacher(model, tokenizer, outdir, calib_path,
     os.makedirs(outdir, exist_ok=True)
     chunks = calib_chunks(tokenizer, calib_path, ctx, n_chunks)
     model.eval()
+    try:
+        dev = next(model.parameters()).device
+    except StopIteration:
+        dev = torch.device("cpu")
     for c, ids in enumerate(chunks):
         f = os.path.join(outdir, f"chunk{c:04d}.npz")
         if os.path.exists(f):
             continue
         with torch.inference_mode():
-            lg = model(ids.unsqueeze(0)).logits[0].float()  # [CTX, V]
+            lg = model(ids.unsqueeze(0).to(dev)).logits[0].float().cpu()  # [CTX, V]
             lp = torch.log_softmax(lg, -1)
             top_lp, top_i = lp.topk(topk, -1)
             tail = torch.log1p(-top_lp.exp().sum(-1).clamp(max=1 - 1e-7))

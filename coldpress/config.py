@@ -76,8 +76,11 @@ class RunConfig:
     cuda: bool = False
     cuda_arch: str = None
     hessian_shards: int = 1
+    hessian_layer_range: tuple = None   # (lo, hi) subrange override for a split-kernel shard
     n_calib_chunks: int = 192
     rows_sample: int = 16384
+    teacher_dtype: str = None     # None -> auto (float32 < 3B params, bfloat16 at/above)
+    teacher_device: str = "cpu"   # cpu | cuda | auto  (auto uses cuda + device_map when avail)
     distill_norm: bool = True
     distill_scales: bool = False
     perm: bool = True            # attempt PERM if a spacemap exists

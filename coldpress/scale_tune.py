@@ -242,12 +242,18 @@ def build_torch_params(gguf_path):
     return out
 
 
-def reconstruct(entry):
+def reconstruct(entry, dtype=None):
     """torch f32 weight [nrow, n_per_row] = d_expanded * A - dmin_expanded * B.
 
     d/dmin are per-superblock scalars [nrow, n_sb] expanded to per-element via
     repeat_interleave(256) (superblocks are 256 elements). A/B are int16 consts cast to f32.
     Differentiable wrt d (and dmin); A/B carry no grad.
+
+    The whole reconstruction is computed in float32 (bit-exact vs DEQUANTIZE); when `dtype`
+    is given (e.g. torch.bfloat16 for a bf16 distill skeleton), the RESULT is cast to it as
+    the LAST step -- so the trainable d/dmin params stay float32 and gradients flow back
+    through the cast, while the value handed to a bf16 functional_call matches the skeleton's
+    dtype. reconstruct-in-f32-then-cast is exactly what this does.
     """
     import torch
     d = entry["d"]
@@ -258,4 +264,6 @@ def reconstruct(entry):
         dmin = entry["dmin"]
         B = entry["B"].to(torch.float32)
         W = W - dmin.repeat_interleave(256, dim=1) * B
+    if dtype is not None and dtype != torch.float32:
+        W = W.to(dtype)
     return W

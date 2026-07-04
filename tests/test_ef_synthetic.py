@@ -24,10 +24,14 @@ def _h_weighted_err(W, What, H):
     return float(np.einsum("ri,ij,rj->", D, H, D))
 
 
+_SEED = {"Q2_K": 101, "Q3_K": 202, "Q4_K": 303, "Q5_K": 404, "Q6_K": 505}
+
+
 @pytest.mark.parametrize("tt", ["Q2_K", "Q3_K", "Q4_K"])
 def test_ef_beats_weighted_rtn(tt):
     n, nrow, T = 512, 24, 4096
-    rng = np.random.default_rng(hash(tt) & 0xFFFF)
+    # deterministic per-type seed (Python's hash() is salted per process -> was flaky)
+    rng = np.random.default_rng(_SEED[tt])
     W = (rng.standard_normal((nrow, n)) ** 3).astype(np.float32)
     H = _correlated_hessian(n, T, seed=0)
     qw = (np.diag(H) / T).astype(np.float32)   # imatrix means for the weighted-RTN baseline

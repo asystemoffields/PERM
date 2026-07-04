@@ -191,7 +191,8 @@ def ef_encode(x, ttype, qw, H, n_iter=2, damp=0.01, act_order=True):
 # ---------------------------------------------------------------- driver
 
 def encode_gguf(f16_path, target_path, hessdir, out_path,
-                imatrix_path=None, perms=None, spacemap=None, only="all",
+                imatrix_path=None, perms=None, spacemap=None, dims=None,
+                acknowledge_unreviewed=False, only="all",
                 n_iter=2, unsafe_storage_order=False, device="cpu", log=print):
     """EF-encode every quantized tensor of `target_path` (a stock quant artifact) using
     the f16 weights from `f16_path` and the Hessians in `hessdir`; write a byte-map-cloned
@@ -199,6 +200,8 @@ def encode_gguf(f16_path, target_path, hessdir, out_path,
 
     perms + spacemap: if given, both the f16 and target GGUFs must already be PERMUTED, and
     this permutes the (original-order) imatrix/Hessians to match via spacemap.input_perm.
+    dims/acknowledge_unreviewed: forwarded to spacemap.input_perm -- required for the
+    attn_output composed index (which needs n_heads) and for the qwen35/gemma4 review gate.
     only: 'all' | 'blk' | 'embdout' for mechanism-attribution ablations.
     device: numpy-only for now (see module docstring); non-cpu logs a notice and proceeds.
     """
@@ -218,10 +221,14 @@ def encode_gguf(f16_path, target_path, hessdir, out_path,
     if unsupported:
         raise ValueError(f"target has types we cannot encode: {unsupported}")
 
+    ack = {"acknowledge_unreviewed": acknowledge_unreviewed} if acknowledge_unreviewed else {}
+
     def input_perm(name):
         if perms is None or spacemap is None:
             return None
-        return spacemap.input_perm(name, perms)
+        # dims lets the spacemap build the composed attn_output index (needs n_heads); it is
+        # optional for qwen3 (inferred) but required for qwen35/gemma4.
+        return spacemap.input_perm(name, perms, dims, **ack)
 
     replace = {}
     stats = {}

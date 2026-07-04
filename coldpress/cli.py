@@ -150,16 +150,21 @@ def cmd_calibrate(cfg, args, wd=None, mf=None, llama=None):
         mf.record("imatrix", ins, [imatrix], llama_commit=llamacpp.PINNED_COMMIT)
     _log(f"imatrix: {imatrix}")
 
-    # 4. Hessians (generic collector, sharded)
+    # 4. Hessians (generic collector, sharded). --hessian-layer-range LO:HI collects only
+    #    that block subrange (split-kernel shard); the manifest entry + marker namespace the
+    #    range so shards do not clobber one another.
     from . import hessians as hess
     from .ggufio import read_typemap
+    from transformers import AutoConfig
     hdir = wd.dir("hessians")
+    lr = cfg.hessian_layer_range
+    stage = f"hessians_{lr[0]}_{lr[1]}" if lr else "hessians"
+    marker = os.path.join(hdir, f".done_{lr[0]}_{lr[1]}" if lr else ".done")
     ins = {"f16": f16, "calib": calib, "shards": cfg.hessian_shards,
-           "chunks": cfg.n_calib_chunks}
-    marker = os.path.join(hdir, ".done")
-    if not mf.is_current("hessians", ins, [marker]):
+           "chunks": cfg.n_calib_chunks, "range": f"{lr[0]}:{lr[1]}" if lr else "full"}
+    if not mf.is_current(stage, ins, [marker]):
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+        from transformers import AutoModelForCausalLM, AutoTokenizer
         tm = read_typemap(f16)
         gguf_ne0 = {n: v["shape"][0] for n, v in tm.items()}
         arch = _arch_of(f16)
@@ -168,17 +173,25 @@ def cmd_calibrate(cfg, args, wd=None, mf=None, llama=None):
         ctx = 512
         n = min(cfg.n_calib_chunks, len(ids) // ctx)
         batches = [ids[c * ctx:(c + 1) * ctx] for c in range(n)]
-        n_layers = AutoConfig.from_pretrained(model_dir).num_hidden_layers
-        shards = _shard_ranges(n_layers, cfg.hessian_shards)
+        config = AutoConfig.from_pretrained(model_dir)
+        n_layers = config.num_hidden_layers
+        dtype, device_map = _resolve_teacher_dtype(config, cfg)
+        _log(f"hessian teacher: dtype={dtype}, device_map={device_map}")
+        shards = [lr] if lr else _shard_ranges(n_layers, cfg.hessian_shards)
         for lo, hi in shards:
-            model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32)
+            kw = {"dtype": dtype}
+            if device_map is not None:
+                kw["device_map"] = device_map
+            model = AutoModelForCausalLM.from_pretrained(model_dir, **kw)
             model.eval()
+            # accumulators stay on CPU (see collect_hessians); a GPU-resident bf16 teacher
+            # forms X^T X on-device and moves it to the host accumulator.
             hs, unmapped = hess.collect_hessians(model, batches, gguf_ne0, arch, n_layers,
                                                  layer_lo=lo, layer_hi=hi, log=_log)
             hess.save_hessians(hs, hdir)
             del model
         open(marker, "w").write("ok")
-        mf.record("hessians", ins, [marker])
+        mf.record(stage, ins, [marker])
     _log(f"hessians: {hdir}")
 
     # 5. teacher top-K cache
@@ -189,9 +202,14 @@ def cmd_calibrate(cfg, args, wd=None, mf=None, llama=None):
     marker = os.path.join(tdir, ".done")
     if not mf.is_current("teacher", ins, [marker]):
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig as _AC
         tok = AutoTokenizer.from_pretrained(model_dir)
-        model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32)
+        dtype, device_map = _resolve_teacher_dtype(_AC.from_pretrained(model_dir), cfg)
+        kw = {"dtype": dtype}
+        if device_map is not None:
+            kw["device_map"] = device_map
+        _log(f"teacher cache: dtype={dtype}, device_map={device_map}")
+        model = AutoModelForCausalLM.from_pretrained(model_dir, **kw)
         tea.cache_teacher(model, tok, tdir, calib, n_chunks=cfg.n_calib_chunks, log=_log)
         del model
         open(marker, "w").write("ok")
@@ -205,6 +223,60 @@ def _shard_ranges(n_layers, shards):
     shards = max(1, shards)
     step = (n_layers + shards - 1) // shards
     return [(lo, min(lo + step, n_layers)) for lo in range(0, n_layers, step)]
+
+
+def _parse_layer_range(s):
+    """'LO:HI' -> (int, int), or None. HI is exclusive."""
+    if not s:
+        return None
+    lo, hi = s.split(":")
+    return (int(lo), int(hi))
+
+
+def _param_count_estimate(config):
+    """Rough total-parameter estimate from a text config (embeddings + per-layer attn+ffn).
+    Used only to pick the default teacher dtype (float32 < 3B, bfloat16 at/above)."""
+    txt = getattr(config, "text_config", config)
+
+    def g(*names, default=0):
+        for n in names:
+            v = getattr(txt, n, None)
+            if v is not None:
+                return v
+        return default
+    d = g("hidden_size")
+    ffn = g("intermediate_size")
+    nl = g("num_hidden_layers")
+    vocab = g("vocab_size")
+    nh = g("num_attention_heads")
+    nkv = g("num_key_value_heads", default=nh)
+    hd = g("head_dim", default=(d // nh if d and nh else 0))
+    if not (d and ffn and nl):
+        return 0
+    per_attn = d * nh * hd + 2 * d * nkv * hd + nh * hd * d          # q,k,v,o (approx)
+    per_ffn = 3 * d * ffn                                            # gate,up,down
+    return int(2 * vocab * d + nl * (per_attn + per_ffn))            # embd (+tied lm_head)
+
+
+def _resolve_teacher_dtype(config, cfg):
+    """Return (torch.dtype, device_map|None). dtype: explicit cfg.teacher_dtype, else auto by
+    param count (bfloat16 at/above 3B). device_map: 'auto' when teacher_device is auto/cuda and
+    CUDA is present, else None (CPU)."""
+    import torch
+    if cfg.teacher_dtype == "bfloat16":
+        dtype = torch.bfloat16
+    elif cfg.teacher_dtype == "float32":
+        dtype = torch.float32
+    else:
+        n = _param_count_estimate(config)
+        dtype = torch.bfloat16 if n >= 3_000_000_000 else torch.float32
+    device_map = None
+    if cfg.teacher_device in ("cuda", "auto"):
+        if torch.cuda.is_available():
+            device_map = "auto"
+        elif cfg.teacher_device == "cuda":
+            raise SystemExit("--teacher-device cuda requested but CUDA is not available")
+    return dtype, device_map
 
 
 def _arch_of(gguf_path):
@@ -260,16 +332,26 @@ def cmd_perm(cfg, args, wd=None, mf=None, llama=None, cal=None):
     if not mf.is_current("perm_optimize", ins, [perms_npz]):
         perms, report = perm_opt.run_perm(sm, cal["f16"], typemap, dims,
                                           imatrix_path=cal["imatrix"],
-                                          rows_sample=cfg.rows_sample, log=_log)
-        sm.save_perms(perms, perms_npz, dims)
+                                          rows_sample=cfg.rows_sample, log=_log, **ack)
+        sm.save_perms(perms, perms_npz, dims, **ack)
         mf.record("perm_optimize", ins, [perms_npz], extra=report)
-    perms = sm.load_perms(perms_npz)
+    perms = sm.load_perms(perms_npz, **ack)
 
-    # G3 gate on the real model
+    # G3 gate on the real model. For big models the fp32 load OOMs, so reuse the teacher-dtype
+    # logic (bf16 at/above 3B); a bf16 forward is not bit-exact, so the gate threshold is
+    # loosened to 5e-3 (documented) -- the permutation is still exact index moves, only the
+    # forward arithmetic differs by bf16 rounding.
     tok_ids = _calib_ids(cal["model_dir"], cfg.resolved_calib(), 256)
-    model = AutoModelForCausalLM.from_pretrained(cal["model_dir"], dtype=torch.float32)
-    d, rel = gates.g3(sm, model, perms, dims, tok_ids, **ack)
-    _log(f"[perm] G3 PASS: rel logits drift {rel:.3e} (max|dlogit|={d:.3e})")
+    g_dtype, g_device_map = _resolve_teacher_dtype(config, cfg)
+    threshold = 5e-3 if g_dtype == torch.bfloat16 else 1e-4
+    kw = {"dtype": g_dtype}
+    if g_device_map is not None:
+        kw["device_map"] = g_device_map
+    model = AutoModelForCausalLM.from_pretrained(cal["model_dir"], **kw)
+    tok_ids = tok_ids.to(next(model.parameters()).device)
+    d, rel = gates.g3(sm, model, perms, dims, tok_ids, threshold=threshold, **ack)
+    _log(f"[perm] G3 PASS: rel logits drift {rel:.3e} (max|dlogit|={d:.3e}) "
+         f"[dtype={g_dtype}, threshold={threshold:.0e}]")
     del model
 
     # apply perms to a copy of the checkpoint, convert -> f16
@@ -288,10 +370,11 @@ def cmd_perm(cfg, args, wd=None, mf=None, llama=None, cal=None):
     perm_imat = os.path.join(pdir, "imatrix-perm.gguf")
     ins = {"imatrix": cal["imatrix"], "perms": perms_npz}
     if not mf.is_current("perm_imatrix", ins, [perm_imat]):
-        perm_im.permute_imatrix(sm, cal["imatrix"], perm_imat, perms, dims, log=_log)
+        perm_im.permute_imatrix(sm, cal["imatrix"], perm_imat, perms, dims, log=_log, **ack)
         mf.record("perm_imatrix", ins, [perm_imat])
     return {"spacemap": sm, "perms": perms, "perms_npz": perms_npz, "dims": dims,
-            "f16": perm_f16, "imatrix": perm_imat, "model_dir": permuted_model}
+            "f16": perm_f16, "imatrix": perm_imat, "model_dir": permuted_model,
+            "acknowledge_unreviewed": bool(ack)}
 
 
 def _calib_ids(model_dir, calib, n_tok):
@@ -333,11 +416,13 @@ def cmd_encode(cfg, args, wd=None, mf=None, llama=None, source=None):
     if source:
         f16, imatrix = source["f16"], source["imatrix"]
         sm, perms, dims = source["spacemap"], source["perms"], source["dims"]
+        enc_ack = bool(source.get("acknowledge_unreviewed"))
         tag = "permef"
     else:
         f16 = os.path.join(wd.dir("f16"), "model-f16.gguf")
         imatrix = os.path.join(wd.dir("imatrix"), "imatrix.gguf")
         sm = perms = dims = None
+        enc_ack = False
         tag = "ef"
     if imatrix and not os.path.exists(imatrix):
         imatrix = None  # calibrate builds it; without it, quantize/EF use the ref path
@@ -355,7 +440,8 @@ def cmd_encode(cfg, args, wd=None, mf=None, llama=None, source=None):
            "imatrix": imatrix, "unsafe": args.unsafe_storage_order}
     if not mf.is_current(f"encode_{tag}", ins, [out]):
         ef.encode_gguf(f16, stock, wd.dir("hessians"), out, imatrix_path=imatrix,
-                       perms=perms, spacemap=sm, unsafe_storage_order=args.unsafe_storage_order,
+                       perms=perms, spacemap=sm, dims=dims, acknowledge_unreviewed=enc_ack,
+                       unsafe_storage_order=args.unsafe_storage_order,
                        device=cfg.device, log=_log)
         mf.record(f"encode_{tag}", ins, [out])
     # byte-parity gate
@@ -378,13 +464,16 @@ def cmd_distill(cfg, args, wd=None, mf=None, enc=None):
     n_layers = config.num_hidden_layers
     teacher_dir = wd.dir("teacher")
     cur = enc["gguf"]
+    # bf16 skeleton for big models (same teacher-dtype rule); trainable d/dmin/norm stay f32.
+    dtype, _dm = _resolve_teacher_dtype(config, cfg)
+    _log(f"[distill] student skeleton dtype={dtype}, device={cfg.device}")
 
     if cfg.distill_norm:
         out = os.path.join(wd.dir("distill"), os.path.basename(cur).replace(".gguf", "-norm.gguf"))
         ins = {"in": cur, "teacher": os.path.join(teacher_dir, ".done"), "steps": args.norm_steps}
         if not mf.is_current("distill_norm", ins, [out]):
             distill.distill_norm(model_dir, arch, n_layers, cur, teacher_dir, out,
-                                 steps=args.norm_steps, log=_log)
+                                 steps=args.norm_steps, dtype=dtype, device=cfg.device, log=_log)
             mf.record("distill_norm", ins, [out])
         cur = out
     if cfg.distill_scales:
@@ -392,7 +481,7 @@ def cmd_distill(cfg, args, wd=None, mf=None, enc=None):
         ins = {"in": cur, "teacher": os.path.join(teacher_dir, ".done"), "steps": args.scale_steps}
         if not mf.is_current("distill_scales", ins, [out]):
             distill.distill_e3b(model_dir, arch, n_layers, cur, teacher_dir, out,
-                                steps=args.scale_steps, device=cfg.device, log=_log)
+                                steps=args.scale_steps, device=cfg.device, dtype=dtype, log=_log)
             mf.record("distill_scales", ins, [out])
         cur = out
     return {"gguf": cur}
@@ -470,8 +559,11 @@ def _cfg_from_args(args):
         cuda=getattr(args, "cuda", False),
         cuda_arch=getattr(args, "cuda_arch", None),
         hessian_shards=getattr(args, "hessian_shards", 1),
+        hessian_layer_range=_parse_layer_range(getattr(args, "hessian_layer_range", None)),
         n_calib_chunks=getattr(args, "calib_chunks", 192),
         rows_sample=getattr(args, "rows_sample", 16384),
+        teacher_dtype=getattr(args, "teacher_dtype", None),
+        teacher_device=getattr(args, "teacher_device", "cpu"),
         distill_norm=getattr(args, "norm", False) or getattr(args, "_default_distill", False),
         distill_scales=getattr(args, "scales", False),
         perm=not getattr(args, "no_perm", False),
@@ -493,6 +585,18 @@ def _add_common(p, hf=True):
     p.add_argument("--cuda", action="store_true")
     p.add_argument("--cuda-arch", dest="cuda_arch", default=None)
     p.add_argument("--hessian-shards", dest="hessian_shards", type=int, default=1)
+    p.add_argument("--hessian-layer-range", dest="hessian_layer_range", default=None,
+                   help="LO:HI -- collect Hessians only for blocks [LO,HI) (split-kernel "
+                        "shard, e.g. the 12B two-shard plan). Manifest entry is namespaced "
+                        "per range.")
+    p.add_argument("--teacher-dtype", dest="teacher_dtype", default=None,
+                   choices=["float32", "bfloat16"],
+                   help="dtype for the FP teacher/skeleton load (default: float32 below 3B "
+                        "params, bfloat16 at/above -- decided from the config).")
+    p.add_argument("--teacher-device", dest="teacher_device", default="cpu",
+                   choices=["cpu", "cuda", "auto"],
+                   help="device for the FP teacher/skeleton (auto/cuda -> device_map='auto' "
+                        "when CUDA is present; Hessian accumulators stay on CPU).")
     p.add_argument("--calib-chunks", dest="calib_chunks", type=int, default=192)
     p.add_argument("--rows-sample", dest="rows_sample", type=int, default=16384)
     p.add_argument("--no-perm", dest="no_perm", action="store_true")

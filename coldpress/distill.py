@@ -79,11 +79,24 @@ def dequant_state_dict(gguf_path, gguf2hf):
     return sd
 
 
-def _make_untied_student(model_dir):
+def _make_untied_student(model_dir, dtype=None, device_map=None):
+    """Load the untied FP student skeleton.
+
+    dtype: torch dtype for the skeleton weights (None -> float32). For 9B/12B a bf16
+    skeleton keeps the frozen weights in ~half the RAM/VRAM; the trainable continuous
+    params (d/dmin scales + norm gains) are held SEPARATELY in float32 by the callers and
+    injected via functional_call, so bf16 here only affects the frozen backbone.
+    device_map: passed through to from_pretrained ('auto'/'cuda' for a GPU-resident bf16
+    skeleton); None keeps the current CPU behavior.
+    """
     from transformers import AutoModelForCausalLM
     import torch
-    model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32,
-                                                 tie_word_embeddings=False)
+    if dtype is None:
+        dtype = torch.float32
+    kw = {"dtype": dtype, "tie_word_embeddings": False}
+    if device_map is not None:
+        kw["device_map"] = device_map
+    model = AutoModelForCausalLM.from_pretrained(model_dir, **kw)
     # assert genuinely untied so we never clobber one role with the other on load
     if hasattr(model, "lm_head") and hasattr(model, "model") and \
        hasattr(model.model, "embed_tokens"):
@@ -114,37 +127,59 @@ def _kl_loss_fn(model, dev, forward):
 
 
 def distill_norm(model_dir, arch, n_layers, gguf_path, teacher_dir, out_path,
-                 steps=200, lr=3e-4, val_frac=0.1, log=print):
-    """NORM: tune only the F32 norm gains; write them back into a copy of the GGUF."""
+                 steps=200, lr=3e-4, val_frac=0.1, dtype=None, device="cpu", log=print):
+    """NORM: tune only the F32 norm gains; write them back into a copy of the GGUF.
+
+    The frozen backbone loads in `dtype` (bf16 for 9B/12B to fit RAM/VRAM); the trainable
+    norm gains are held as SEPARATE float32 params and injected via functional_call, cast to
+    the skeleton dtype only at forward time -- so the tuned gains stay full precision. Teacher
+    targets are the precomputed top-K cache (no live teacher here)."""
     import torch
+    from torch.func import functional_call
+    if dtype is None:
+        dtype = torch.float32
+    dev = torch.device(device)
     files = sorted(_glob.glob(os.path.join(teacher_dir, "chunk*.npz")))
     assert files, teacher_dir
     n_val = max(1, int(len(files) * val_frac))
     val_files, train_files = files[:n_val], files[n_val:]
 
-    model = _make_untied_student(model_dir)
+    model = _make_untied_student(model_dir, dtype=dtype)
+    model.eval()
+    model.to(dev)
+    for p in model.parameters():
+        p.requires_grad = False
     gguf2hf, hf2gguf, norm_map = build_name_maps(model, arch, n_layers)
-    sd = dequant_state_dict(gguf_path, gguf2hf)
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    assert not [m for m in missing if "rotary" not in m and "rope" not in m.lower()], missing
-    model.train(False)
-    for n, p in model.named_parameters():
-        p.requires_grad = n in norm_map
-    params = [p for p in model.parameters() if p.requires_grad]
+    # frozen weights in the skeleton dtype; norm gains kept as separate float32 params
+    sd_f32 = dequant_state_dict(gguf_path, gguf2hf)
+    base_sd = {k: v.to(dev, dtype) for k, v in sd_f32.items()}
+    norm_params = {hf: sd_f32[hf].to(dev, torch.float32).clone().requires_grad_(True)
+                   for hf in norm_map}
+    params = list(norm_params.values())
     log(f"trainable norm params: {sum(p.numel() for p in params)}")
     opt = torch.optim.Adam(params, lr=lr)
 
-    kl_loss = _kl_loss_fn(model, torch.device("cpu"),
-                          lambda ids: model(ids.unsqueeze(0)).logits[0])
+    def computed_sd():
+        sd = dict(base_sd)
+        for hf, p in norm_params.items():
+            sd[hf] = p.to(dtype)
+        return sd
+
+    kl_loss = _kl_loss_fn(
+        model, dev,
+        lambda ids: functional_call(model, computed_sd(), (ids.unsqueeze(0),)).logits[0])
 
     def val():
         with torch.no_grad():
             return float(np.mean([kl_loss(f).item() for f in val_files]))
 
+    def snapshot():
+        return {hf: p.detach().clone() for hf, p in norm_params.items()}
+
     v0 = val()
     log(f"val KL before: {v0:.5f}")
     best = v0
-    best_state = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
+    best_state = snapshot()
     rng = np.random.default_rng(0)
     for s in range(steps):
         f = train_files[rng.integers(len(train_files))]
@@ -157,11 +192,10 @@ def distill_norm(model_dir, arch, n_layers, gguf_path, teacher_dir, out_path,
             log(f"step {s+1}/{steps} train {loss.item():.5f} val {v:.5f}")
             if v < best:
                 best = v
-                best_state = {n: p.detach().clone()
-                              for n, p in model.named_parameters() if p.requires_grad}
+                best_state = snapshot()
     log(f"val KL: {v0:.5f} -> {best:.5f} ({(best/v0-1)*100:+.1f}%)")
 
-    replace_f32 = {gname: best_state[hf].numpy().astype(np.float32)
+    replace_f32 = {gname: best_state[hf].cpu().numpy().astype(np.float32)
                    for hf, gname in norm_map.items()}
     reemit(gguf_path, out_path, replace_f32=replace_f32)
     json.dump({"val_before": v0, "val_after": best, "steps": steps, "lr": lr,
@@ -170,11 +204,18 @@ def distill_norm(model_dir, arch, n_layers, gguf_path, teacher_dir, out_path,
 
 
 def distill_e3b(model_dir, arch, n_layers, gguf_path, teacher_dir, out_path,
-                steps=300, lr=2e-4, device="cpu", val_frac=0.1, log=print):
-    """E3B: tune every quantized tensor's fp16 d/dmin + all F32 norm gains."""
+                steps=300, lr=2e-4, device="cpu", val_frac=0.1, dtype=None, log=print):
+    """E3B: tune every quantized tensor's fp16 d/dmin + all F32 norm gains.
+
+    The functional_call skeleton loads the frozen backbone in `dtype` (bf16 for 9B/12B to fit
+    RAM/VRAM); the trainable d/dmin scales and norm gains stay FLOAT32, and reconstruct()/
+    norm injection cast to the skeleton dtype only at forward time. Teacher targets are the
+    precomputed top-K cache (no live teacher at distill time)."""
     import torch
     from torch.func import functional_call
     from gguf import GGUFReader
+    if dtype is None:
+        dtype = torch.float32
 
     files = sorted(_glob.glob(os.path.join(teacher_dir, "chunk*.npz")))
     assert files, teacher_dir
@@ -182,14 +223,16 @@ def distill_e3b(model_dir, arch, n_layers, gguf_path, teacher_dir, out_path,
     val_files, train_files = files[:n_val], files[n_val:]
     dev = torch.device(device)
 
-    model = _make_untied_student(model_dir)
+    model = _make_untied_student(model_dir, dtype=dtype)
     model.eval()
     model.to(dev)
     for p in model.parameters():
         p.requires_grad = False
     gguf2hf, hf2gguf, norm_map = build_name_maps(model, arch, n_layers)
 
-    base_sd = {k: v.to(dev) for k, v in dequant_state_dict(gguf_path, gguf2hf).items()}
+    # frozen backbone tensors in the skeleton dtype; trainable params stay float32
+    sd_f32 = dequant_state_dict(gguf_path, gguf2hf)
+    base_sd = {k: v.to(dev, dtype) for k, v in sd_f32.items()}
     entries = scale_tune.build_torch_params(gguf_path)
     params = []
     for name, e in entries.items():
@@ -201,9 +244,10 @@ def distill_e3b(model_dir, arch, n_layers, gguf_path, teacher_dir, out_path,
         e["A"] = e["A"].to(dev)
         if e["B"] is not None:
             e["B"] = e["B"].to(dev)
+    # norm gains: float32 init from the (float32) dequant, held separately from the bf16 sd
     norm_params = {}
     for hf in norm_map:
-        norm_params[hf] = base_sd[hf].clone().requires_grad_(True)
+        norm_params[hf] = sd_f32[hf].to(dev, torch.float32).clone().requires_grad_(True)
         params.append(norm_params[hf])
     n_train = sum(p.numel() for p in params)
     log(f"trainable params: {n_train} ({len(entries)} quant tensors + {len(norm_params)} norms)")
@@ -211,9 +255,9 @@ def distill_e3b(model_dir, arch, n_layers, gguf_path, teacher_dir, out_path,
     def computed_sd():
         sd = dict(base_sd)
         for gname, e in entries.items():
-            sd[gguf2hf[gname]] = scale_tune.reconstruct(e)
+            sd[gguf2hf[gname]] = scale_tune.reconstruct(e, dtype=dtype)
         for hf, p in norm_params.items():
-            sd[hf] = p
+            sd[hf] = p.to(dtype)
         return sd
 
     kl_loss = _kl_loss_fn(
