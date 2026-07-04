@@ -12,6 +12,11 @@ _REGISTRY = {
     "qwen3_5": "qwen35",
     "gemma4": "gemma4",
     "gemma3": "gemma4",  # provisional: same text-stack family (UNREVIEWED map, gated)
+    # google/gemma-4-12B(-it) ship as any-to-any wrappers reporting model_type
+    # 'gemma4_unified'; route their nested text stack to the gemma4 map (UNREVIEWED, gated,
+    # requires --strip-vision + acknowledge_unreviewed; needs a G3 gate on the real text
+    # stack before ship). Provisional, same status as the gemma3 alias above.
+    "gemma4_unified": "gemma4",
 }
 
 
