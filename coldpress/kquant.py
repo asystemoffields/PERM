@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Vectorized numpy reimplementation of ggml k-quant containers (llama.cpp @ 039e20a2).
 
-Faithful to /data/coldpress/results/kquant-reference.md:
+Faithful to the kquant reference (results/kquant-reference.md):
 - decoders: bit-exact.
 - encoders: algorithm-faithful, vectorized across blocks. numpy pairwise summation may
   flip rare near-tie scale acceptances vs C's sequential fp32 loops -> not guaranteed

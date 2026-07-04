@@ -15,7 +15,7 @@ where A, B are constant integer-product tensors read out of the container bytes:
 sb(c)    = c // 256                (superblock index; superblocks are 256 elements)
 block(c) = c // SUB_W[ttype]       (sub-block index within the row)
 
-Per-type semantics (from /data/coldpress/results/kquant-reference.md, matched byte-for-byte
+Per-type semantics (from the kquant reference (results/kquant-reference.md), matched byte-for-byte
 against kquant.DEQUANTIZE):
   Q2_K : 16 subblocks/superblock, SUB_W=16. sc=scales[j]. A=(sc&0xF)*q, q in 0..3.  B=(sc>>4).
   Q3_K : 16 subblocks/superblock, SUB_W=16. A=(sc-32)*q_signed, q in -4..3.          B=None (no dmin).
