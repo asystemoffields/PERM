@@ -90,4 +90,4 @@ hard fail) on random permutations. See `docs/spacemaps.md` and `RECIPE.md §10`.
 
 ## License
 
-See `LICENSE` (TODO: Alex chooses — suggest MIT or Apache-2.0).
+Licensed under the [MIT License](LICENSE).

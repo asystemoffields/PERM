@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Container-aware encoding of standard GGUF k-quants (PERM + EF + NORM/E3B)."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license = {text = "MIT"}
 authors = [{ name = "asystemoffields" }]
 keywords = ["gguf", "llama.cpp", "quantization", "k-quant", "gptq", "permutation"]
 classifiers = [
