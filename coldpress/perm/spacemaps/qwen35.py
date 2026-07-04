@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # =============================================================================
-#  ##  PENDING FABLE REVIEW + G3 GATE ON REAL WEIGHTS  ##
+#  ##  CODE REVIEWED (Fable, 2026-07-04) — G3 GATE ON REAL WEIGHTS STILL REQUIRED  ##
+#  Review applied 3 fixes: language_model prefix handling, attn_output input_perm
+#  composition (the permef-v1 bug class), multimodal guard (gemma4). The
+#  acknowledge_unreviewed flag stays until g3_check passes on the real checkpoint.
 #  This space map is a Fable DERIVATION (2026-07-04) implemented by Opus from the
 #  tensor-edit table in src/spacemaps/qwen35.py. It has NOT been reviewed against the
 #  original derivation, and NO G3 logits-equality gate has been run on real Qwen3.5
@@ -83,7 +86,28 @@ def input_perm(gguf_name, perms, dims=None, acknowledge_unreviewed=False):
         return np.asarray(perms["res"])
     if kind == "ffn_down":
         return np.asarray(perms["ffn"][layer])
-    return None  # attn_output ne0 perm requires the gate/GQA composition; author later
+    if kind == "attn_output":
+        # o ne[0] = n_heads*head_dim; q-heads {group*h..group*h+group-1} carry P_vo[l][h].
+        # Linear-attn layers (P_lav frozen) and layers without vo entries -> identity.
+        assert dims is not None, "dims required for attn_output input_perm"
+        n_cols = dims["n_heads"] * _HD
+        idx = np.arange(n_cols)
+        if layer in perms.get("vo", {}):
+            group = dims["n_heads"] // dims["n_kv"]
+            for h in range(dims["n_kv"]):
+                p = np.asarray(perms["vo"][layer][h])
+                for qh in range(group * h, group * h + group):
+                    idx[qh * _HD:(qh + 1) * _HD] = qh * _HD + p
+        return idx
+    return None
+
+
+def _prefix(sd):
+    """Qwen3.5 checkpoints nest the text stack under model.language_model.* (verified in
+    the fetched Qwen/Qwen3.5-9B safetensors index); plain model.* also accepted."""
+    if any(k.startswith("model.language_model.") for k in sd):
+        return "model.language_model."
+    return "model."
 
 
 def apply_perms(sd, perms, dims, consume=False, acknowledge_unreviewed=False):
@@ -95,6 +119,7 @@ def apply_perms(sd, perms, dims, consume=False, acknowledge_unreviewed=False):
     _guard(acknowledge_unreviewed)
     import torch
     P = np.asarray(perms["res"])
+    pre_root = _prefix(sd)
 
     def sel(w, dim, idx):
         return w.index_select(dim, torch.from_numpy(np.ascontiguousarray(idx)).long())
@@ -104,18 +129,20 @@ def apply_perms(sd, perms, dims, consume=False, acknowledge_unreviewed=False):
 
     out = {name: w for name, w in list(sd.items())}
     Pt = P
-    out["model.embed_tokens.weight"] = sel(take("model.embed_tokens.weight"), 1, Pt)
+    emb = pre_root + "embed_tokens.weight"
+    out[emb] = sel(take(emb), 1, Pt)
     if "lm_head.weight" in sd:
         out["lm_head.weight"] = sel(take("lm_head.weight"), 1, Pt)   # UNTIED real tensor
-    out["model.norm.weight"] = sel(take("model.norm.weight"), 0, Pt)
+    nrm = pre_root + "norm.weight"
+    out[nrm] = sel(take(nrm), 0, Pt)
     # mtp.* tensors are dropped by conversion; delete rather than permute
-    for k in [k for k in out if k.startswith("model.mtp") or k.startswith("mtp.")]:
+    for k in [k for k in out if ".mtp" in k or k.startswith("mtp.")]:
         del out[k]
 
     group = dims["n_heads"] // dims["n_kv"]
     full = set(dims["full_attn_layers"])
     for l in range(dims["n_layers"]):
-        pre = f"model.layers.{l}."
+        pre = f"{pre_root}layers.{l}."
         Pf = np.asarray(perms["ffn"][l])
         for n in ("input_layernorm.weight", "post_attention_layernorm.weight"):
             if pre + n in sd:

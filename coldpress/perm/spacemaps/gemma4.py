@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # =============================================================================
-#  ##  PENDING FABLE REVIEW + G3 GATE ON REAL WEIGHTS  ##
+#  ##  CODE REVIEWED (Fable, 2026-07-04) — G3 GATE ON REAL WEIGHTS STILL REQUIRED  ##
+#  Review applied 3 fixes: language_model prefix handling, attn_output input_perm
+#  composition (the permef-v1 bug class), multimodal guard (gemma4). The
+#  acknowledge_unreviewed flag stays until g3_check passes on the real checkpoint.
 #  Fable DERIVATION (2026-07-04) implemented by Opus from the tensor-edit table in
 #  src/spacemaps/gemma4.py. NOT reviewed against the derivation; NO G3 logits-equality
 #  gate run on real Gemma-4 weights. Every entry point raises NotImplementedError unless
@@ -91,7 +94,20 @@ def input_perm(gguf_name, perms, dims=None, acknowledge_unreviewed=False):
         return np.asarray(perms["res"])
     if kind == "ffn_down":
         return np.asarray(perms["ffn"][layer])
-    return None  # attn_output ne0 perm on sliding layers: author with the GQA composition
+    if kind == "attn_output":
+        # sliding layers: o ne[0] = 16*256 with P_vo per kv-head; global layers: 16*512,
+        # frozen identity in v1 (K=V sharing analysis in the derivation doc).
+        assert dims is not None, "dims required for attn_output input_perm"
+        if layer in perms.get("vo", {}):
+            idx = np.arange(dims["n_heads"] * _HD)
+            group = dims["n_heads"] // dims["n_kv"]
+            for h in range(dims["n_kv"]):
+                p = np.asarray(perms["vo"][layer][h])
+                for qh in range(group * h, group * h + group):
+                    idx[qh * _HD:(qh + 1) * _HD] = qh * _HD + p
+            return idx
+        return None  # global layer: identity (frozen)
+    return None
 
 
 def _prefix(sd):
@@ -107,6 +123,17 @@ def apply_perms(sd, perms, dims, consume=False, acknowledge_unreviewed=False):
     import torch
     P = np.asarray(perms["res"])
     pre_root = _prefix(sd)
+    # Multimodal guard: the vision tower passes through untouched, but any projector
+    # writing INTO the permuted text residual would silently break vision. Text-only
+    # shipping is the reviewed path; acknowledge explicitly to proceed with vision
+    # tensors present (their projector output rows are NOT permuted here).
+    vision_keys = [k for k in sd if "vision" in k or "multi_modal_projector" in k]
+    if vision_keys:
+        raise NotImplementedError(
+            f"checkpoint has {len(vision_keys)} vision-tower tensors; the gemma4 spacemap "
+            "is reviewed for TEXT-ONLY use (the multimodal projector seam is unhandled — "
+            "see src/spacemaps/gemma4.py derivation). Strip the vision tower or extend "
+            "the map with the projector out-row permutation first.")
 
     def sel(w, dim, idx):
         return w.index_select(dim, torch.from_numpy(np.ascontiguousarray(idx)).long())
