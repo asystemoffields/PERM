@@ -110,11 +110,18 @@ def _prefix(sd):
     return "model."
 
 
-def apply_perms(sd, perms, dims, consume=False, acknowledge_unreviewed=False):
+def apply_perms(sd, perms, dims, consume=False, acknowledge_unreviewed=False,
+                strip_vision=False):
     """Apply P_res + P_ffn + P_vo(full-attn) to a Qwen3.5 HF state dict (text stack names).
 
     Mirrors the qwen3 pattern; the ONLY structural difference is the doubled q_proj (the
     gate half co-permutes, the query half does not) and the per-layer full/linear split.
+
+    strip_vision: accepted for CLI signature uniformity but a NO-OP here. Qwen3.5 multimodal
+    checkpoints keep the text stack under model.language_model.*; any vision-tower tensors are
+    left untouched in the state dict and are dropped by the text-only GGUF conversion (unlike
+    gemma4, which deletes them explicitly). Extending qwen35 to a real strip/multimodal seam
+    is a reviewed follow-up.
     """
     _guard(acknowledge_unreviewed)
     import torch

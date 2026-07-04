@@ -7,7 +7,9 @@ value-free tensor edits that realize a coordinated permutation. Each module expo
     dims_from_config(config) -> dict         d_model,d_ffn,n_layers,n_heads,n_kv,head_dim
     identity_perms(dims)                     the identity element
     save_perms(perms,path) / load_perms(path)
-    apply_perms(state_dict, perms, dims, consume=False)   pure index_select on an HF sd
+    apply_perms(state_dict, perms, dims, consume=False, strip_vision=False)
+                                            pure index_select on an HF sd; strip_vision drops
+                                            vision-tower/projector tensors (gemma4), else no-op
     apply_perms_inplace(model, perms, dims)               in-place on a loaded HF model
     input_perm(gguf_tensor_name, perms) -> perm|None      ne[0]-axis perm (imatrix/Hessian)
     optimize(weights, ttypes, qws, dims, rows_sample) -> (perms, report)

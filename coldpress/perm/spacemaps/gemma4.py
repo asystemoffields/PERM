@@ -117,8 +117,14 @@ def _prefix(sd):
     return "model."
 
 
-def apply_perms(sd, perms, dims, consume=False, acknowledge_unreviewed=False):
-    """Apply P_res + P_ffn + P_vo(sliding) to a Gemma4 HF state dict (text stack)."""
+def apply_perms(sd, perms, dims, consume=False, acknowledge_unreviewed=False,
+                strip_vision=False):
+    """Apply P_res + P_ffn + P_vo(sliding) to a Gemma4 HF state dict (text stack).
+
+    strip_vision=True: DELETE vision-tower/projector tensors and proceed text-only
+    (they are dropped by text-only GGUF conversion anyway). The resulting artifact is
+    a TEXT-ONLY ship; multimodal use would need the projector out-row permutation
+    (see the derivation doc)."""
     _guard(acknowledge_unreviewed)
     import torch
     P = np.asarray(perms["res"])
@@ -128,6 +134,11 @@ def apply_perms(sd, perms, dims, consume=False, acknowledge_unreviewed=False):
     # shipping is the reviewed path; acknowledge explicitly to proceed with vision
     # tensors present (their projector output rows are NOT permuted here).
     vision_keys = [k for k in sd if "vision" in k or "multi_modal_projector" in k]
+    if vision_keys and strip_vision:
+        for k in vision_keys:
+            sd.pop(k)
+        print(f"[gemma4 spacemap] stripped {len(vision_keys)} vision tensors (text-only ship)")
+        vision_keys = []
     if vision_keys:
         raise NotImplementedError(
             f"checkpoint has {len(vision_keys)} vision-tower tensors; the gemma4 spacemap "

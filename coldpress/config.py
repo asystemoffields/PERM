@@ -82,6 +82,7 @@ class RunConfig:
     distill_scales: bool = False
     perm: bool = True            # attempt PERM if a spacemap exists
     acknowledge_unreviewed: bool = False
+    strip_vision: bool = False   # gemma4: drop vision-tower/projector tensors, text-only ship
     threads: int = 4
 
     def resolved_calib(self):

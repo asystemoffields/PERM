@@ -138,8 +138,11 @@ def _dims_from_perms(perms):
 
 # ---------------------------------------------------------------- apply (state dict)
 
-def apply_perms(sd, perms, dims, consume=False):
-    """New HF state dict with permutations applied (pure index_select)."""
+def apply_perms(sd, perms, dims, consume=False, strip_vision=False):
+    """New HF state dict with permutations applied (pure index_select).
+
+    strip_vision: accepted for CLI signature uniformity; no-op here (qwen3 is a text-only
+    dense arch with no vision tower)."""
     import torch
     nl, nkv, hd, nh = dims["n_layers"], dims["n_kv"], dims["head_dim"], dims["n_heads"]
     group = _gqa_group(dims)

@@ -275,7 +275,8 @@ def cmd_perm(cfg, args, wd=None, mf=None, llama=None, cal=None):
     # apply perms to a copy of the checkpoint, convert -> f16
     pdir = wd.dir("perm")
     permuted_model = os.path.join(pdir, "model-permuted")
-    _write_permuted_checkpoint(sm, cal["model_dir"], permuted_model, perms, dims, ack)
+    _write_permuted_checkpoint(sm, cal["model_dir"], permuted_model, perms, dims, ack,
+                               strip_vision=cfg.strip_vision)
     perm_f16 = os.path.join(pdir, "model-permuted-f16.gguf")
     ins = {"permuted": permuted_model}
     if not mf.is_current("perm_f16", ins, [perm_f16]):
@@ -300,14 +301,16 @@ def _calib_ids(model_dir, calib, n_tok):
     return tok(text, return_tensors="pt").input_ids[:, :n_tok]
 
 
-def _write_permuted_checkpoint(sm, src_dir, out_dir, perms, dims, ack):
+def _write_permuted_checkpoint(sm, src_dir, out_dir, perms, dims, ack, strip_vision=False):
     import shutil
     from safetensors.torch import load_file, save_file
     os.makedirs(out_dir, exist_ok=True)
     # load state dict (single-file safetensors expected for small models)
     st = os.path.join(src_dir, "model.safetensors")
     sd = load_file(st)
-    out = sm.apply_perms(sd, perms, dims, consume=True, **ack)
+    # strip_vision is honoured by the gemma4 spacemap (text-only ship: delete vision-tower /
+    # multi_modal_projector tensors); other spacemaps accept and ignore it (no-op).
+    out = sm.apply_perms(sd, perms, dims, consume=True, strip_vision=strip_vision, **ack)
     save_file(out, os.path.join(out_dir, "model.safetensors"), metadata={"format": "pt"})
     for f in ["config.json", "generation_config.json", "tokenizer.json",
               "tokenizer_config.json", "vocab.json", "merges.txt", "special_tokens_map.json"]:
@@ -473,6 +476,7 @@ def _cfg_from_args(args):
         distill_scales=getattr(args, "scales", False),
         perm=not getattr(args, "no_perm", False),
         acknowledge_unreviewed=getattr(args, "acknowledge_unreviewed", False),
+        strip_vision=getattr(args, "strip_vision", False),
         threads=getattr(args, "threads", 4),
     )
 
@@ -512,6 +516,9 @@ def build_parser():
     p = sub.add_parser("onboard"); _add_common(p)
     p = sub.add_parser("calibrate"); _add_common(p)
     p = sub.add_parser("perm"); _add_common(p)
+    p.add_argument("--strip-vision", dest="strip_vision", action="store_true",
+                   help="gemma4: drop vision-tower/projector tensors before permuting "
+                        "(text-only ship); no-op on other spacemaps")
     p = sub.add_parser("encode"); _add_common(p)
     p.add_argument("--norm", action="store_true")
     p.add_argument("--scales", action="store_true")
@@ -524,6 +531,9 @@ def build_parser():
     p.add_argument("--ppl-check", dest="ppl_check", default=None)
     p.add_argument("--prompt", default="The capital of France is")
     p = sub.add_parser("quantize"); _add_common(p)
+    p.add_argument("--strip-vision", dest="strip_vision", action="store_true",
+                   help="gemma4: drop vision-tower/projector tensors before permuting "
+                        "(text-only ship); no-op on other spacemaps")
     p.add_argument("--out", default=None)
     p.add_argument("--norm", action="store_true", default=True)
     p.add_argument("--scales", action="store_true")
