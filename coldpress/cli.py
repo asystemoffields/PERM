@@ -159,7 +159,7 @@ def cmd_calibrate(cfg, args, wd=None, mf=None, llama=None):
     marker = os.path.join(hdir, ".done")
     if not mf.is_current("hessians", ins, [marker]):
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
         tm = read_typemap(f16)
         gguf_ne0 = {n: v["shape"][0] for n, v in tm.items()}
         arch = _arch_of(f16)
@@ -168,8 +168,7 @@ def cmd_calibrate(cfg, args, wd=None, mf=None, llama=None):
         ctx = 512
         n = min(cfg.n_calib_chunks, len(ids) // ctx)
         batches = [ids[c * ctx:(c + 1) * ctx] for c in range(n)]
-        config = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32).config
-        n_layers = config.num_hidden_layers
+        n_layers = AutoConfig.from_pretrained(model_dir).num_hidden_layers
         shards = _shard_ranges(n_layers, cfg.hessian_shards)
         for lo, hi in shards:
             model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32)

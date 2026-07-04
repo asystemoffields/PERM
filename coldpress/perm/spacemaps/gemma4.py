@@ -142,8 +142,6 @@ def apply_perms(sd, perms, dims, consume=False, acknowledge_unreviewed=False):
                 v_rows = np.arange(v.shape[0])
                 v_rows[h * _HD:(h + 1) * _HD] = h * _HD + p
                 v = sel(v, 0, v_rows)
-                for qh in (group * h, group * h + group - 1) if group > 1 else (group * h,):
-                    pass
                 for qh in [group * h + j for j in range(group)]:
                     o_cols = np.arange(o.shape[1])
                     o_cols[qh * _HD:(qh + 1) * _HD] = qh * _HD + p
