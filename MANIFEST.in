@@ -1,0 +1,5 @@
+include README.md RECIPE.md LICENSE pyproject.toml
+recursive-include coldpress/data *.txt
+recursive-include paper *
+recursive-include docs *
+recursive-include tests *.py

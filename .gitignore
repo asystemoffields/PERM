@@ -1,0 +1,20 @@
+# build / packaging
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.eggs/
+
+# coldpress run artifacts
+coldpress-work/
+*.gguf
+*.npz
+!coldpress/data/*
+_build_logs/
+llama.cpp-build/
+
+# editors / os
+.DS_Store
+*.swp

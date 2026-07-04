@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coldpress"
+version = "0.1.0"
+description = "Container-aware encoding of standard GGUF k-quants (PERM + EF + NORM/E3B)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "asystemoffields" }]
+keywords = ["gguf", "llama.cpp", "quantization", "k-quant", "gptq", "permutation"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "numpy>=1.24",
+  # pip gguf API verified against 0.19.0 (GGUFReader fields/tensors/data, GGUFWriter
+  # add_tensor(raw_shape=BYTE_shape)/add_key_value(sub_type=), quants.dequantize,
+  # tensor_mapping.get_tensor_name_map(MODEL_ARCH_enum, n_layers)). Pin the tested floor.
+  "gguf>=0.19,<0.20",
+  "torch>=2.2",
+  "transformers>=4.44",
+  "safetensors>=0.4",
+  "huggingface_hub>=0.23",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+coldpress = "coldpress.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/asystemoffields/PERM"
+
+[tool.setuptools.packages.find]
+include = ["coldpress*"]
+
+[tool.setuptools.package-data]
+coldpress = ["data/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
