@@ -94,6 +94,7 @@ class RunConfig:
     rows_sample: int = 16384
     teacher_dtype: str = None     # None -> auto (float32 < 3B params, bfloat16 at/above)
     teacher_device: str = "cpu"   # cpu | cuda | auto  (auto uses cuda + device_map when avail)
+    no_teacher: bool = False      # skip the teacher top-K cache (permef-only, no distill)
     distill_norm: bool = True
     distill_scales: bool = False
     perm: bool = True            # attempt PERM if a spacemap exists

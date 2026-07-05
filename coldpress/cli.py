@@ -196,26 +196,29 @@ def cmd_calibrate(cfg, args, wd=None, mf=None, llama=None):
         mf.record(stage, ins, [marker])
     _log(f"hessians: {hdir}")
 
-    # 5. teacher top-K cache
+    # 5. teacher top-K cache (skippable: it is consumed ONLY by cmd_distill)
     from . import teacher as tea
     tdir = wd.dir("teacher")
-    ins = {"model": os.path.join(model_dir, ".downloaded"), "calib": calib,
-           "chunks": cfg.n_calib_chunks}
-    marker = os.path.join(tdir, ".done")
-    if not mf.is_current("teacher", ins, [marker]):
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig as _AC
-        tok = AutoTokenizer.from_pretrained(model_dir)
-        dtype, device_map = _resolve_teacher_dtype(_AC.from_pretrained(model_dir), cfg)
-        kw = {"dtype": dtype}
-        if device_map is not None:
-            kw["device_map"] = device_map
-        _log(f"teacher cache: dtype={dtype}, device_map={device_map}")
-        model = AutoModelForCausalLM.from_pretrained(model_dir, **kw)
-        tea.cache_teacher(model, tok, tdir, calib, n_chunks=cfg.n_calib_chunks, log=_log)
-        del model
-        open(marker, "w").write("ok")
-        mf.record("teacher", ins, [marker])
+    if cfg.no_teacher:
+        _log("teacher cache: SKIPPED (--no-teacher; permef-only, no distill)")
+    else:
+        ins = {"model": os.path.join(model_dir, ".downloaded"), "calib": calib,
+               "chunks": cfg.n_calib_chunks}
+        marker = os.path.join(tdir, ".done")
+        if not mf.is_current("teacher", ins, [marker]):
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig as _AC
+            tok = AutoTokenizer.from_pretrained(model_dir)
+            dtype, device_map = _resolve_teacher_dtype(_AC.from_pretrained(model_dir), cfg)
+            kw = {"dtype": dtype}
+            if device_map is not None:
+                kw["device_map"] = device_map
+            _log(f"teacher cache: dtype={dtype}, device_map={device_map}")
+            model = AutoModelForCausalLM.from_pretrained(model_dir, **kw)
+            tea.cache_teacher(model, tok, tdir, calib, n_chunks=cfg.n_calib_chunks, log=_log)
+            del model
+            open(marker, "w").write("ok")
+            mf.record("teacher", ins, [marker])
     _log(f"teacher: {tdir}")
     return {"model_dir": model_dir, "f16": f16, "imatrix": imatrix,
             "hessians": hdir, "teacher": tdir}
@@ -579,6 +582,7 @@ def _cfg_from_args(args):
         rows_sample=getattr(args, "rows_sample", 16384),
         teacher_dtype=getattr(args, "teacher_dtype", None),
         teacher_device=getattr(args, "teacher_device", "cpu"),
+        no_teacher=getattr(args, "no_teacher", False),
         distill_norm=getattr(args, "norm", False) or getattr(args, "_default_distill", False),
         distill_scales=getattr(args, "scales", False),
         perm=not getattr(args, "no_perm", False),
@@ -612,6 +616,10 @@ def _add_common(p, hf=True):
                    choices=["cpu", "cuda", "auto"],
                    help="device for the FP teacher/skeleton (auto/cuda -> device_map='auto' "
                         "when CUDA is present; Hessian accumulators stay on CPU).")
+    p.add_argument("--no-teacher", dest="no_teacher", action="store_true",
+                   help="skip the teacher top-K cache (calibrate step 5). For permef-only "
+                        "workflows that never distill; do NOT combine with quantize's default "
+                        "--norm distill, which requires the teacher.")
     p.add_argument("--calib-chunks", dest="calib_chunks", type=int, default=192)
     p.add_argument("--rows-sample", dest="rows_sample", type=int, default=16384)
     p.add_argument("--no-perm", dest="no_perm", action="store_true")
