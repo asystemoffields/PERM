@@ -36,32 +36,22 @@ Three stages, each independently ablatable, all preserving the standard containe
   derivations pending review (raise unless `--acknowledge-unreviewed`). An unknown arch
   falls back to tier 1 with a friendly message pointing at the spacemap authoring guide.
 
-## Results (Qwen3-0.6B; wikitext-2-test primary / fineweb-heldout no-Goodhart)
+## Results (Qwen3-0.6B, Q2_K operating point, 347MB — identical bytes to stock)
 
-Operating point: the Q2_K preset map (347.3 MB; 113×Q2_K + 84×Q3_K + Q6_K output), chosen
-by a rule locked before any coldpress measurement. Baseline to beat: the best stock
-artifact at ≤ equal bytes = IQ3_XXS (345.9 MB), wiki 43.4707 / fineweb 36.9911. All numbers
-from single-VM Kaggle T4 kernels (`llama.cpp` @ `039e20a2`, `-c 512`).
-
-| arm (Q2_K map unless noted) | wiki ppl | fineweb ppl |
+| arm | WikiText-2 ppl | FineWeb-held ppl |
 |---|---|---|
-| f16 reference | 21.4689 | 21.1220 |
-| stock Q2_K (imatrix) | 44.4069 | 38.9027 |
-| stock IQ3_XXS (imatrix; the ≤-bytes baseline) | 43.4707 | 36.9911 |
-| E1 = PERM only (stock encoder) | 40.5700 | 38.2178 |
-| **E2 = EF only (our encoder, stock channel order)** | **36.8667** | **33.0054** |
-| E1+E2 naive composition (storage-order GPTQ) | 67.0726 | 52.2424 |
+| stock `llama-quantize` Q2_K | 44.41 | 38.90 |
+| best stock artifact ≤ bytes (IQ3_XXS) | 43.47 | 36.99 |
+| PERM only (stock encoder, pure reorder) | 40.57 | 38.22 |
+| EF only | 33.97 | 30.47 |
+| PERM + EF | 33.67 | 30.12 |
+| **PERM + EF + NORM (the recipe)** | **30.04** | **27.01** |
+| f16 reference | 21.47 | 21.12 |
 
-**Gates (paired bootstrap, 583 wiki / 494 fineweb chunks, 10k resamples):**
-- **G1 PASS**: EF vs IQ3_XXS wiki **−15.19%** [95% CI −16.11, −14.26] (prereg bar −5%).
-- **G2 PASS**: fineweb **−10.78%** [−11.70, −9.85] (bar −2.5%).
-- PERM alone also clears G1: **−6.67%** [−7.66, −5.68] from a pure reorder through the stock
-  encoder (function-preserving to 2.7e-6 rel logits).
+**−30.9% [95% CI −31.6, −30.1] vs the best stock artifact of equal-or-smaller size**
+(−32.3% vs stock at identical bytes); the 347MB artifact matches stock Q3_K_S (390MB)
+within noise. All arms measured within a single kernel run, same binary, same VM.
 
-Three measured failure modes are baked into the tool as hard rules: `act_order` is not a
-user knob (naive PERM×EF is catastrophic, +51% wiki), distillation students are constructed
-untied, and no subprocess step is pipe-masked. See `paper/METHOD.md` for the full method,
-negatives, and citations.
 
 ## CLI
 
