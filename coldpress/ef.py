@@ -28,6 +28,7 @@ equivalence test (identical integer codes on synthetic + one real tensor vs this
 path) before it can become the default (contract hard rule 6).
 """
 import json
+import sys
 import time
 
 import numpy as np
@@ -42,16 +43,45 @@ F32 = np.float32
 
 # ---------------------------------------------------------------- encoder core
 
-def cholesky_inv_upper(H, damp=0.01):
-    """GPTQ: returns U = chol(inv(H_damped), upper). H: [n,n] f64."""
+def cholesky_inv_upper(H, damp=0.01, _max_tries=6):
+    """GPTQ: returns U = chol(inv(H_damped), upper). H: [n,n] f64.
+
+    H = X^T X is symmetric PSD, but numerically it can be borderline -- rank-deficient from
+    limited calibration and, at scale, perturbed by fp16 Hessian storage (off-diagonals are
+    stored float16, SCALE blocker #2) plus the permuted column order. A single fixed damping
+    then leaves inv(H) with a tiny negative eigenvalue and np.linalg.cholesky raises "Matrix
+    is not positive definite" (observed on a real ffn tensor -- it killed a ~5.6 h pkgval run
+    at the final encode). We escalate the diagonal load geometrically until the factorization
+    succeeds; because H is PSD, H + c*mean_diag*I is strictly PD for large enough c, so this
+    always converges.
+
+    The FIRST attempt is bit-identical to the historical fixed-damp path, so every tensor
+    that already encoded is byte-for-byte unchanged (the frozen champion is untouched); only
+    tensors that used to CRASH take a larger, localized load -- softer error feedback there,
+    never a relaxed correctness gate (the artifact is still decided on real perplexity)."""
     n = H.shape[0]
     H = H.astype(np.float64).copy()
-    mean_diag = np.mean(np.diag(H))
-    H[np.diag_indices(n)] += damp * mean_diag + 1e-8
-    Hinv = np.linalg.inv(H)
-    Hinv = (Hinv + Hinv.T) / 2
-    U = np.linalg.cholesky(Hinv).T
-    return np.ascontiguousarray(U)
+    mean_diag = float(np.mean(np.diag(H)))
+    base = mean_diag if mean_diag > 0.0 else 1.0
+    d = damp
+    for attempt in range(_max_tries):
+        Hd = H.copy()
+        Hd[np.diag_indices(n)] += d * base + 1e-8
+        try:
+            Hinv = np.linalg.inv(Hd)
+            Hinv = (Hinv + Hinv.T) / 2
+            U = np.linalg.cholesky(Hinv).T
+        except np.linalg.LinAlgError:
+            d *= 10.0
+            continue
+        if attempt:
+            print(f"[ef] cholesky_inv_upper: damp escalated {damp:g} -> {d:g} in "
+                  f"{attempt} step(s) for a borderline Hessian (n={n})",
+                  file=sys.stderr, flush=True)
+        return np.ascontiguousarray(U)
+    raise np.linalg.LinAlgError(
+        f"cholesky_inv_upper: inv(H) not positive definite even after escalating damp to "
+        f"{d / 10.0:g} (n={n}); Hessian appears degenerate")
 
 
 def _grid_params(ttype, raw, nrow, n):
