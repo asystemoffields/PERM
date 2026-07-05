@@ -391,8 +391,8 @@ def cmd_perm(cfg, args, wd=None, mf=None, llama=None, cal=None):
         perm_im.permute_imatrix(sm, cal["imatrix"], perm_imat, perms, dims, log=_log, **ack)
         mf.record("perm_imatrix", ins, [perm_imat])
     return {"spacemap": sm, "perms": perms, "perms_npz": perms_npz, "dims": dims,
-            "f16": perm_f16, "imatrix": perm_imat, "model_dir": permuted_model,
-            "acknowledge_unreviewed": bool(ack)}
+            "f16": perm_f16, "imatrix": perm_imat, "imatrix_orig": cal["imatrix"],
+            "model_dir": permuted_model, "acknowledge_unreviewed": bool(ack)}
 
 
 def _calib_ids(model_dir, calib, n_tok):
@@ -432,18 +432,26 @@ def cmd_encode(cfg, args, wd=None, mf=None, llama=None, source=None):
     from . import ef, gates
 
     if source:
-        f16, imatrix = source["f16"], source["imatrix"]
+        f16, imatrix = source["f16"], source["imatrix"]   # imatrix = PERMUTED (stock byte-map)
         sm, perms, dims = source["spacemap"], source["perms"], source["dims"]
+        # encode_gguf permutes the ORIGINAL-order imatrix itself (qw[p], matching the validated
+        # research e2_ef.py); handing it the ALREADY-permuted imatrix double-permutes the weights
+        # (measured on 0.6B: median err-vs-stock +188%, wiki +58%). So the stock byte-map target
+        # uses the permuted imatrix, but the EF weighting uses the original.
+        imatrix_ef = source.get("imatrix_orig", imatrix)
         enc_ack = bool(source.get("acknowledge_unreviewed"))
         tag = "permef"
     else:
         f16 = os.path.join(wd.dir("f16"), "model-f16.gguf")
         imatrix = os.path.join(wd.dir("imatrix"), "imatrix.gguf")
+        imatrix_ef = imatrix    # stock orientation: no perms, encode_gguf leaves it as-is
         sm = perms = dims = None
         enc_ack = False
         tag = "ef"
     if imatrix and not os.path.exists(imatrix):
         imatrix = None  # calibrate builds it; without it, quantize/EF use the ref path
+    if imatrix_ef and not os.path.exists(imatrix_ef):
+        imatrix_ef = None
 
     # stock quant at preset (the byte-map target)
     stock = os.path.join(wd.dir("encode"), f"stock-{tag}-{cfg.preset}.gguf")
@@ -455,9 +463,9 @@ def cmd_encode(cfg, args, wd=None, mf=None, llama=None, source=None):
 
     out = os.path.join(wd.dir("encode"), f"coldpress-{tag}-{cfg.preset}.gguf")
     ins = {"f16": f16, "stock": stock, "hessians": os.path.join(wd.dir("hessians"), ".done"),
-           "imatrix": imatrix, "unsafe": args.unsafe_storage_order}
+           "imatrix": imatrix_ef, "unsafe": args.unsafe_storage_order}
     if not mf.is_current(f"encode_{tag}", ins, [out]):
-        ef.encode_gguf(f16, stock, wd.dir("hessians"), out, imatrix_path=imatrix,
+        ef.encode_gguf(f16, stock, wd.dir("hessians"), out, imatrix_path=imatrix_ef,
                        perms=perms, spacemap=sm, dims=dims, acknowledge_unreviewed=enc_ack,
                        unsafe_storage_order=args.unsafe_storage_order,
                        device=cfg.device, log=_log)
