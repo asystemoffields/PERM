@@ -68,3 +68,27 @@ def test_ef_on_fp16_roundtripped_H_beats_stock(tt, tmp_path):
     e_ef = _h_weighted_err(W, ef_recon, H)
     assert e_ef < e_rtn, f"{tt}: EF (fp16-RT H) {e_ef:.4g} !< RTN {e_rtn:.4g}"
     assert e_ef < 0.97 * e_rtn, f"{tt}: EF improvement only {(1 - e_ef / e_rtn) * 100:.2f}%"
+
+
+def test_fp16_storage_no_overflow_on_large_hessian(tmp_path):
+    """X^T X accumulated over ~1e5 tokens (massive-activation channels) far exceeds float16's
+    65504 max; the per-matrix hscale must keep stored off-diagonals FINITE. Regression for the
+    pkgval-3/4 crash: off-diagonals cast to +-inf -> inv(H) all-inf -> encoder dies."""
+    n = 512
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((20000, n)).astype(np.float32)
+    X[:, :4] *= 80.0                                        # massive-activation channels
+    X += rng.standard_normal((20000, 1)).astype(np.float32) * 30.0  # shared -> big off-diagonals
+    H = (X.T @ X).astype(np.float32)
+    off = ~np.eye(n, dtype=bool)
+    assert float(np.max(np.abs(H[off]))) > 65504, "test H must exceed fp16 max off-diagonal"
+    hess.save_hessians({"blk.0.ffn_down.weight": {"H": H, "n": 20000}}, str(tmp_path))
+    Hr, _ = hess.load_hessian(str(tmp_path), "blk.0.ffn_down.weight")
+    assert np.all(np.isfinite(Hr)), "loaded Hessian has inf/nan (fp16 overflow not handled)"
+    # diagonal exact; whole matrix preserved to fp16 relative precision (Frobenius, big-entry dominated)
+    assert np.array_equal(np.diag(Hr), np.diag(H).astype(np.float32).astype(np.float64))
+    fro = float(np.linalg.norm(Hr - H) / np.linalg.norm(H))
+    assert fro < 1e-3, f"fp16-scaled storage Frobenius rel error too high: {fro:.2e}"
+    # and the GPTQ factor is finite (the thing that used to crash)
+    U = ef.cholesky_inv_upper(Hr, damp=0.01)
+    assert np.all(np.isfinite(U))

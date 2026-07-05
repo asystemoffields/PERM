@@ -179,20 +179,32 @@ def collect_hessians(model, batches, gguf_ne0, arch, n_layers,
     return hessians, unmapped
 
 
+FP16_SAFE_MAX = 32768.0  # < float16 finite max (65504), with headroom for rounding
+
+
 def save_hessians(hessians, outdir):
-    """Persist each Hessian as float16 off-diagonal + a float32 diagonal ("diag32").
+    """Persist each Hessian as float16 off-diagonal + a float32 diagonal ("diag32"), with a
+    per-matrix scale so the float16 store never OVERFLOWS to +-inf.
 
     An input Hessian H = X^T X is symmetric PSD; its DIAGONAL is the per-channel second
     moment that dominates both the GPTQ damping (mean of diag) and the token_embd column
-    weights, so it is kept EXACT in float32 while the (large, off-diagonal) bulk is stored in
-    float16 -- roughly halving the handoff. load_hessian writes the f32 diagonal back over the
-    fp16 one. Old float32-only npz files still load unchanged (no diag32 key)."""
+    weights, so it is kept EXACT in float32. The (large, off-diagonal) bulk is stored in
+    float16 to roughly halve the handoff -- but X^T X accumulated over ~1e5 calibration tokens
+    (massive-activation channels especially) routinely exceeds float16's 65504 finite max,
+    which casts to +-inf and destroys the matrix (an all-inf inverse breaks the EF encoder).
+    We therefore store H / hscale, with hscale chosen so max|H| lands well under 65504, and
+    multiply back on load; the exact f32 diagonal is then written over the rescaled fp16 one.
+    Old npz (float32-only, or fp16 without hscale) still load unchanged."""
     os.makedirs(outdir, exist_ok=True)
     for gname, h in hessians.items():
         fn = os.path.join(outdir, gname.replace(".", "_") + ".npz")
         H = np.asarray(h["H"], dtype=np.float32)
         diag32 = np.ascontiguousarray(np.diag(H)).astype(np.float32)
-        np.savez_compressed(fn, H=H.astype(np.float16), diag32=diag32, n=h["n"], name=gname)
+        amax = float(np.max(np.abs(H))) if H.size else 0.0
+        hscale = amax / FP16_SAFE_MAX if amax > FP16_SAFE_MAX else 1.0
+        H16 = (H / np.float32(hscale)).astype(np.float16)
+        np.savez_compressed(fn, H=H16, diag32=diag32, hscale=np.float32(hscale),
+                            n=h["n"], name=gname)
 
 
 def _fallback_key(gguf_name):
@@ -222,8 +234,10 @@ def load_hessian(hessdir, gguf_name):
         if os.path.exists(path):
             z = np.load(path)
             H = np.asarray(z["H"]).astype(np.float64)
+            if "hscale" in z.files:
+                H *= float(z["hscale"])  # undo the fp16 overflow-avoidance scale (off-diagonals)
             if "diag32" in z.files:
-                # fp16-stored H: restore the exact float32 diagonal over the fp16 one
+                # fp16-stored H: restore the exact float32 diagonal over the rescaled fp16 one
                 np.fill_diagonal(H, np.asarray(z["diag32"]).astype(np.float64))
             return H, int(z["n"])
     raise FileNotFoundError(f"no Hessian for {gguf_name} (tried {cand})")
