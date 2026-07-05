@@ -354,6 +354,19 @@ def cmd_perm(cfg, args, wd=None, mf=None, llama=None, cal=None):
          f"[dtype={g_dtype}, threshold={threshold:.0e}]")
     del model
 
+    # --perms-only: stop after the gate. The split scale chain re-derives the permuted
+    # checkpoint / permuted f16 / permuted imatrix DETERMINISTICALLY from perms.npz in a
+    # downstream kernel (apply_perms is pure index_select), so the big artifacts never cross
+    # kernel boundaries. This also sidesteps _write_permuted_checkpoint's single-file
+    # model.safetensors assumption, which does not hold for sharded big-model snapshots.
+    if getattr(args, "perms_only", False):
+        _log(f"[perm] --perms-only: perms.npz saved + G3 gate passed; skipping permuted "
+             f"checkpoint / f16 / imatrix materialization (downstream re-derives them from "
+             f"{perms_npz})")
+        return {"spacemap": sm, "perms": perms, "perms_npz": perms_npz, "dims": dims,
+                "f16": None, "imatrix": None, "model_dir": None,
+                "acknowledge_unreviewed": bool(ack)}
+
     # apply perms to a copy of the checkpoint, convert -> f16
     pdir = wd.dir("perm")
     permuted_model = os.path.join(pdir, "model-permuted")
@@ -623,6 +636,10 @@ def build_parser():
     p.add_argument("--strip-vision", dest="strip_vision", action="store_true",
                    help="gemma4: drop vision-tower/projector tensors before permuting "
                         "(text-only ship); no-op on other spacemaps")
+    p.add_argument("--perms-only", dest="perms_only", action="store_true",
+                   help="stop after the G3 gate: save perms.npz but skip materializing the "
+                        "permuted checkpoint / f16 / imatrix (split scale chain: a downstream "
+                        "kernel re-derives them deterministically from perms.npz)")
     p = sub.add_parser("encode"); _add_common(p)
     p.add_argument("--norm", action="store_true")
     p.add_argument("--scales", action="store_true")
