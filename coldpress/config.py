@@ -13,6 +13,19 @@ import time
 from dataclasses import dataclass, field, asdict
 
 
+def text_config(config):
+    """Unwrap a multimodal wrapper config to its text stack.
+
+    Real big-model repos (Qwen3.5-*, gemma-4-*) ship any-to-any wrapper configs whose text
+    dims (num_hidden_layers, hidden_size, ...) nest under `text_config`; plain text configs
+    are returned unchanged. Every dims/num_hidden_layers read in the package goes through
+    this ONE helper -- keep it that way (the spacemaps unwrap internally with the same rule).
+    NOTE: config.model_type stays a TOP-LEVEL read everywhere (the spacemap registry keys on
+    the wrapper's model_type, e.g. 'gemma4_unified')."""
+    tc = getattr(config, "text_config", None)
+    return tc if tc is not None else config
+
+
 def _versions(llama_commit=None):
     v = {}
     try:

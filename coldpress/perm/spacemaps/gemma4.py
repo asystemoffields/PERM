@@ -50,7 +50,9 @@ def _guard(acknowledge_unreviewed):
 
 def dims_from_config(config, acknowledge_unreviewed=False):
     _guard(acknowledge_unreviewed)
-    txt = getattr(config, "text_config", config)
+    # the ONE wrapper-unwrap rule, shared with cli/onboard: config.text_config
+    from ...config import text_config
+    txt = text_config(config)
     n_layers = int(txt.num_hidden_layers)
     global_layers = []
     lt = getattr(txt, "layer_types", None)

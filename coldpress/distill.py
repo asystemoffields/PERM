@@ -13,6 +13,13 @@ a tied student would clobber one role with the other on load.
 
 Name maps (GGUF<->HF, which params are norm gains) are built GENERICALLY from the loaded
 model via gguf's TensorNameMap -- no hardcoded per-arch tables.
+
+STUDENT CONSTRUCTION IS STREAMED (scale fix): the GGUF is dequantized ONE tensor at a time
+straight into the skeleton's parameter storages (stream_student_from_gguf), so peak extra
+RAM = one tensor (~2 GB at 12B) instead of the full f32 sd (~4 B/param = ~48 GB at 12B).
+Strict accounting replaces load_state_dict(strict): every GGUF tensor must land in exactly
+one shape-matched parameter, and every parameter must be covered (rope/rotary tables
+excepted). Both NORM and E3B then train through PARTIAL functional_call overrides.
 """
 import glob as _glob
 import json
@@ -56,9 +63,26 @@ def build_name_maps(model, arch, n_layers):
     return gguf2hf, hf2gguf, norm
 
 
-def dequant_state_dict(gguf_path, gguf2hf):
-    """HF-named f32 state dict with weights dequantized from the GGUF (bit-faithful)."""
+def _dequant_gguf_tensor(t):
+    """Dequantize ONE GGUF reader tensor -> f32 torch tensor (bit-faithful)."""
     import torch
+    tt = t.tensor_type.name
+    data = np.asarray(t.data)
+    if tt in ("F32", "F16", "BF16"):
+        w = data.astype(np.float32)
+    elif tt in kq.DEQUANTIZE:
+        ne0 = int(t.shape[0])
+        w = kq.DEQUANTIZE[tt](data.reshape(data.shape[0], -1), ne0)
+    else:
+        raise ValueError(f"no decoder for {tt} ({t.name})")
+    return torch.from_numpy(np.ascontiguousarray(w))
+
+
+def dequant_state_dict(gguf_path, gguf2hf):
+    """HF-named f32 state dict with weights dequantized from the GGUF (bit-faithful).
+
+    Materializes the FULL f32 sd (~4 B/param) -- fine for small models and tests; big-model
+    student construction uses stream_student_from_gguf instead (one tensor at a time)."""
     from gguf import GGUFReader
     r = GGUFReader(gguf_path)
     sd = {}
@@ -66,17 +90,62 @@ def dequant_state_dict(gguf_path, gguf2hf):
         hf = gguf2hf.get(t.name)
         if hf is None:
             raise KeyError(f"GGUF tensor {t.name} has no HF mapping (name-map gap)")
-        tt = t.tensor_type.name
-        data = np.asarray(t.data)
-        if tt in ("F32", "F16", "BF16"):
-            w = data.astype(np.float32)
-        elif tt in kq.DEQUANTIZE:
-            ne0 = int(t.shape[0])
-            w = kq.DEQUANTIZE[tt](data.reshape(data.shape[0], -1), ne0)
-        else:
-            raise ValueError(f"no decoder for {tt} ({t.name})")
-        sd[hf] = torch.from_numpy(np.ascontiguousarray(w))
+        sd[hf] = _dequant_gguf_tensor(t)
     return sd
+
+
+def stream_student_from_gguf(model, gguf_path, gguf2hf, keep_f32=(), log=print):
+    """Stream the GGUF into the (frozen) student skeleton's parameter storages IN PLACE.
+
+    Per tensor: dequantize ONE GGUF tensor to f32, copy_ into the matching parameter (which
+    casts to the skeleton's dtype/device), free -- peak extra RAM = one tensor (~2 GB at 12B)
+    instead of the full f32 sd (~48 GB). Serves BOTH norm and scales student construction.
+
+    keep_f32: iterable of HF param names whose EXACT f32 values (pre-cast) are captured and
+    returned as {hf: f32 CPU tensor} -- the trainable norm gains initialize from these, so a
+    bf16 skeleton does not round the norm init.
+
+    STRICT ACCOUNTING (we no longer go through load_state_dict, so we enforce its `strict`
+    contract ourselves):
+      * every GGUF tensor MUST map to an existing parameter with a matching shape (KeyError /
+        ValueError otherwise -- a GGUF tensor with no parameter home is a name-map gap);
+      * every model parameter MUST be covered by some GGUF tensor, except rope/rotary
+        position tables (buffers/params computed at init, permutation-independent).
+    """
+    import torch
+    from gguf import GGUFReader
+    params = dict(model.named_parameters())
+    keep_f32 = set(keep_f32)
+    captured = {}
+    loaded = set()
+    r = GGUFReader(gguf_path)
+    with torch.no_grad():
+        for t in r.tensors:
+            hf = gguf2hf.get(t.name)
+            if hf is None:
+                raise KeyError(f"GGUF tensor {t.name} has no HF mapping (name-map gap)")
+            p = params.get(hf)
+            if p is None:
+                raise KeyError(f"GGUF tensor {t.name} maps to {hf!r}, which is not a "
+                               f"parameter of the student (strict accounting)")
+            w = _dequant_gguf_tensor(t)
+            if tuple(p.shape) != tuple(w.shape):
+                raise ValueError(f"{t.name} -> {hf}: shape {tuple(w.shape)} != parameter "
+                                 f"shape {tuple(p.shape)}")
+            if hf in keep_f32:
+                captured[hf] = w.clone()
+            p.copy_(w)          # casts f32 -> skeleton dtype and moves to its device
+            loaded.add(hf)
+            del w
+    not_loaded = [n for n in params if n not in loaded
+                  and "rotary" not in n and "rope" not in n.lower()]
+    assert not not_loaded, (f"{len(not_loaded)} parameter(s) not covered by any GGUF tensor "
+                            f"(strict accounting): {not_loaded[:6]}")
+    missing_f32 = keep_f32 - set(captured)
+    assert not missing_f32, f"keep_f32 names absent from the GGUF: {sorted(missing_f32)[:6]}"
+    log(f"streamed {len(loaded)} tensors into the student skeleton "
+        f"(captured {len(captured)} f32 norm gains)")
+    return captured
 
 
 def _make_untied_student(model_dir, dtype=None, device_map=None):
@@ -130,10 +199,12 @@ def distill_norm(model_dir, arch, n_layers, gguf_path, teacher_dir, out_path,
                  steps=200, lr=3e-4, val_frac=0.1, dtype=None, device="cpu", log=print):
     """NORM: tune only the F32 norm gains; write them back into a copy of the GGUF.
 
-    The frozen backbone loads in `dtype` (bf16 for 9B/12B to fit RAM/VRAM); the trainable
-    norm gains are held as SEPARATE float32 params and injected via functional_call, cast to
-    the skeleton dtype only at forward time -- so the tuned gains stay full precision. Teacher
-    targets are the precomputed top-K cache (no live teacher here)."""
+    The frozen backbone loads in `dtype` (bf16 for 9B/12B to fit RAM/VRAM) and the GGUF is
+    STREAMED into its parameter storages one tensor at a time (peak extra RAM = one tensor,
+    not the full f32 sd). The trainable norm gains are SEPARATE float32 params (exact f32
+    init captured during streaming) injected via a PARTIAL functional_call override, cast to
+    the skeleton dtype only at forward time. Teacher targets are the precomputed top-K cache
+    (no live teacher here)."""
     import torch
     from torch.func import functional_call
     if dtype is None:
@@ -150,20 +221,20 @@ def distill_norm(model_dir, arch, n_layers, gguf_path, teacher_dir, out_path,
     for p in model.parameters():
         p.requires_grad = False
     gguf2hf, hf2gguf, norm_map = build_name_maps(model, arch, n_layers)
-    # frozen weights in the skeleton dtype; norm gains kept as separate float32 params
-    sd_f32 = dequant_state_dict(gguf_path, gguf2hf)
-    base_sd = {k: v.to(dev, dtype) for k, v in sd_f32.items()}
-    norm_params = {hf: sd_f32[hf].to(dev, torch.float32).clone().requires_grad_(True)
+    # stream the GGUF into the frozen skeleton (strict accounting inside); the exact f32
+    # norm-gain values are captured pre-cast for the trainable init
+    f32_norms = stream_student_from_gguf(model, gguf_path, gguf2hf,
+                                         keep_f32=set(norm_map), log=log)
+    norm_params = {hf: f32_norms[hf].to(dev, torch.float32).clone().requires_grad_(True)
                    for hf in norm_map}
     params = list(norm_params.values())
     log(f"trainable norm params: {sum(p.numel() for p in params)}")
     opt = torch.optim.Adam(params, lr=lr)
 
     def computed_sd():
-        sd = dict(base_sd)
-        for hf, p in norm_params.items():
-            sd[hf] = p.to(dtype)
-        return sd
+        # PARTIAL override: only the norm gains; every other weight comes from the streamed
+        # skeleton (functional_call falls back to module params for missing keys)
+        return {hf: p.to(dtype) for hf, p in norm_params.items()}
 
     kl_loss = _kl_loss_fn(
         model, dev,
@@ -208,9 +279,13 @@ def distill_e3b(model_dir, arch, n_layers, gguf_path, teacher_dir, out_path,
     """E3B: tune every quantized tensor's fp16 d/dmin + all F32 norm gains.
 
     The functional_call skeleton loads the frozen backbone in `dtype` (bf16 for 9B/12B to fit
-    RAM/VRAM); the trainable d/dmin scales and norm gains stay FLOAT32, and reconstruct()/
-    norm injection cast to the skeleton dtype only at forward time. Teacher targets are the
-    precomputed top-K cache (no live teacher at distill time)."""
+    RAM/VRAM) and the GGUF is STREAMED into its parameter storages (peak extra RAM = one
+    tensor; no full f32 sd, no separate base_sd copy). The trainable d/dmin scales and norm
+    gains stay FLOAT32; reconstruct()/norm injection cast to the skeleton dtype only at
+    forward time via a PARTIAL functional_call override (non-quantized, non-norm tensors come
+    from the streamed skeleton). Teacher targets are the precomputed top-K cache (no live
+    teacher at distill time). NOTE the remaining at-scale memory term: the int16 A/B code
+    consts (~4 B/param) -- see SCALE-NOTES (E3B deferred at 9B/12B pending streamed-A/B)."""
     import torch
     from torch.func import functional_call
     from gguf import GGUFReader
@@ -230,9 +305,9 @@ def distill_e3b(model_dir, arch, n_layers, gguf_path, teacher_dir, out_path,
         p.requires_grad = False
     gguf2hf, hf2gguf, norm_map = build_name_maps(model, arch, n_layers)
 
-    # frozen backbone tensors in the skeleton dtype; trainable params stay float32
-    sd_f32 = dequant_state_dict(gguf_path, gguf2hf)
-    base_sd = {k: v.to(dev, dtype) for k, v in sd_f32.items()}
+    # stream the GGUF into the frozen skeleton (strict accounting inside); exact f32 norm init
+    f32_norms = stream_student_from_gguf(model, gguf_path, gguf2hf,
+                                         keep_f32=set(norm_map), log=log)
     entries = scale_tune.build_torch_params(gguf_path)
     params = []
     for name, e in entries.items():
@@ -244,18 +319,18 @@ def distill_e3b(model_dir, arch, n_layers, gguf_path, teacher_dir, out_path,
         e["A"] = e["A"].to(dev)
         if e["B"] is not None:
             e["B"] = e["B"].to(dev)
-    # norm gains: float32 init from the (float32) dequant, held separately from the bf16 sd
     norm_params = {}
     for hf in norm_map:
-        norm_params[hf] = sd_f32[hf].to(dev, torch.float32).clone().requires_grad_(True)
+        norm_params[hf] = f32_norms[hf].to(dev, torch.float32).clone().requires_grad_(True)
         params.append(norm_params[hf])
     n_train = sum(p.numel() for p in params)
     log(f"trainable params: {n_train} ({len(entries)} quant tensors + {len(norm_params)} norms)")
 
     def computed_sd():
-        sd = dict(base_sd)
-        for gname, e in entries.items():
-            sd[gguf2hf[gname]] = scale_tune.reconstruct(e, dtype=dtype)
+        # PARTIAL override: reconstructed quant tensors + norm gains; everything else falls
+        # back to the streamed skeleton parameters
+        sd = {gguf2hf[gname]: scale_tune.reconstruct(e, dtype=dtype)
+              for gname, e in entries.items()}
         for hf, p in norm_params.items():
             sd[hf] = p.to(dtype)
         return sd

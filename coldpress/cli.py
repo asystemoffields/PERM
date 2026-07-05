@@ -20,7 +20,7 @@ import os
 import sys
 
 from . import __version__, llamacpp
-from .config import RunConfig, Workdir, Manifest
+from .config import RunConfig, Workdir, Manifest, text_config
 from .perm import registry
 
 
@@ -32,9 +32,13 @@ def _log(msg=""):
 
 # candidate matmul ne[0] values that MUST be divisible by 256 for k-quants
 def onboard_report(config):
+    # dims come from the TEXT stack (multimodal wrappers nest them under text_config);
+    # model_type / spacemap keying stays on the TOP-LEVEL config.
+    txt = text_config(config)
+
     def g(*names, default=None):
         for n in names:
-            v = getattr(config, n, None)
+            v = getattr(txt, n, None)
             if v is not None:
                 return v
         return default
@@ -62,7 +66,8 @@ def onboard_report(config):
         "bad_dims": bad,
         "tier": 2 if spacemap is not None else 1,
         "spacemap": model_type if spacemap is not None else None,
-        "tie_word_embeddings": bool(getattr(config, "tie_word_embeddings", False)),
+        "tie_word_embeddings": bool(getattr(txt, "tie_word_embeddings",
+                                            getattr(config, "tie_word_embeddings", False))),
     }
 
 
@@ -70,9 +75,6 @@ def cmd_onboard(cfg, args):
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained(cfg.hf_id, revision=cfg.revision,
                                         trust_remote_code=args.trust_remote_code)
-    if hasattr(config, "text_config") and getattr(config, "model_type", "") in (
-            "gemma4", "gemma3", "qwen2_vl", "qwen3_vl"):
-        pass  # keep the top-level model_type for spacemap keying
     rep = onboard_report(config)
     _log(f"== onboard {cfg.hf_id} (rev {cfg.revision or 'default'}) ==")
     _log(f"  model_type : {rep['model_type']}")
@@ -174,7 +176,7 @@ def cmd_calibrate(cfg, args, wd=None, mf=None, llama=None):
         n = min(cfg.n_calib_chunks, len(ids) // ctx)
         batches = [ids[c * ctx:(c + 1) * ctx] for c in range(n)]
         config = AutoConfig.from_pretrained(model_dir)
-        n_layers = config.num_hidden_layers
+        n_layers = text_config(config).num_hidden_layers   # wrapper-safe (one helper, everywhere)
         dtype, device_map = _resolve_teacher_dtype(config, cfg)
         _log(f"hessian teacher: dtype={dtype}, device_map={device_map}")
         shards = [lr] if lr else _shard_ranges(n_layers, cfg.hessian_shards)
@@ -236,7 +238,7 @@ def _parse_layer_range(s):
 def _param_count_estimate(config):
     """Rough total-parameter estimate from a text config (embeddings + per-layer attn+ffn).
     Used only to pick the default teacher dtype (float32 < 3B, bfloat16 at/above)."""
-    txt = getattr(config, "text_config", config)
+    txt = text_config(config)
 
     def g(*names, default=0):
         for n in names:
@@ -474,7 +476,7 @@ def cmd_distill(cfg, args, wd=None, mf=None, enc=None):
     model_dir = wd.dir("model")
     config = AutoConfig.from_pretrained(model_dir)
     arch = _arch_of(os.path.join(wd.dir("f16"), "model-f16.gguf"))
-    n_layers = config.num_hidden_layers
+    n_layers = text_config(config).num_hidden_layers   # wrapper-safe (one helper, everywhere)
     teacher_dir = wd.dir("teacher")
     cur = enc["gguf"]
     # bf16 skeleton for big models (same teacher-dtype rule); trainable d/dmin/norm stay f32.

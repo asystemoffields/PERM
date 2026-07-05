@@ -45,8 +45,9 @@ def _guard(acknowledge_unreviewed):
 def dims_from_config(config, acknowledge_unreviewed=False):
     _guard(acknowledge_unreviewed)
     # multimodal wrapper config nests the text stack under text_config; a plain text config
-    # is used directly (mirrors the gemma4 map + the onboard text-stack handling).
-    txt = getattr(config, "text_config", config)
+    # is used directly (the ONE unwrap rule, shared with cli/onboard: config.text_config).
+    from ...config import text_config
+    txt = text_config(config)
     n_layers = int(txt.num_hidden_layers)
     # full-attn layer indices: prefer an explicit layer_types list; else the 3,7,... pattern
     full = []
